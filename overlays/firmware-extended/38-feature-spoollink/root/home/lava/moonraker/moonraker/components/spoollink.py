@@ -30,6 +30,26 @@ UNLINK_METHOD = "spoollink_unlink_card"
 SET_ENDPOINT = "spoollink/set"
 
 
+class _StaleResolution(asyncio.CancelledError):
+    pass
+
+
+class _Channel:
+    def __init__(self) -> None:
+        self.uid = ""
+        self.event_time = 0.
+        self.generation = 0
+        self.klipper_generation = 0
+        self.confirmed_uid = ""
+        self.confirmed_id = 0
+        self.hold_id = 0
+        self.invalidated_id = 0
+        self.reading = False
+        self.pending: Optional[dict] = None
+        self.task: Optional[asyncio.Future] = None
+        self.verification: Optional[asyncio.Future] = None
+
+
 def _unquote(value: str) -> str:
     s = value.strip()
     if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
@@ -63,6 +83,10 @@ class SpoolLink:
         self.klippy_apis: APIComp = self.server.lookup_component("klippy_apis")
 
         self._channel_event_times: Dict[int, float] = {}
+        self._channels: Dict[int, _Channel] = {}
+        self._status_revision = 0
+        self._blocked_uids: set = set()
+        self._unlinking_uids: set = set()
         self._toolhead_extruder: str = "extruder"
         self._ptc_spool_ids: List[int] = []
         self._active_spool_id: Optional[int] = None
@@ -92,11 +116,17 @@ class SpoolLink:
             "filament_detect": None,
             "print_task_config": ["filament_spool_id"],
             "toolhead": ["extruder"],
+            "spoollink": ["generation"],
         }, self._handle_status_update, {})
         self._handle_status_update(status, 0.)
 
     def _handle_klippy_disconnect(self) -> None:
         logging.info("[spoollink] Klippy disconnected")
+        for state in self._channels.values():
+            for task in (state.task, state.verification):
+                if task is not None:
+                    task.cancel()
+        self._channels = {}
         self._channel_event_times = {}
         self._ptc_spool_ids = []
         self._active_spool_id = None
@@ -111,6 +141,7 @@ class SpoolLink:
             self._fire(self._sync_active_spool())
 
     def _handle_status_update(self, status: Dict[str, Any], eventtime: float) -> None:
+        self._status_revision += 1
         th = status.get("toolhead")
         if th is not None:
             extruder = th.get("extruder")
@@ -118,7 +149,25 @@ class SpoolLink:
                 logging.info("[spoollink] toolhead extruder changed: %s → %s",
                              self._toolhead_extruder, extruder)
                 self._toolhead_extruder = extruder
-                self._fire(self._sync_active_spool())
+
+        router = status.get("spoollink", {})
+        for ch, generation in enumerate(router.get("generation", [])):
+            state = self._channels.setdefault(ch, _Channel())
+            if generation != state.klipper_generation:
+                state.generation += 1
+                state.klipper_generation = generation
+                state.confirmed_id = state.hold_id = 0
+                state.pending = None
+
+        # Сначала обрабатываем свидетельство чтения, затем сброс номера.
+        fd = status.get("filament_detect", {})
+        for ch, reading in enumerate(fd.get("state", [])):
+            state = self._channels.setdefault(ch, _Channel())
+            was_reading, state.reading = state.reading, reading == 1
+            if was_reading and not state.reading and state.hold_id and state.task is None:
+                self._verify_zero(ch, state)
+        for ch, info in enumerate(fd.get("info", [])):
+            self._handle_filament_detect_channel(ch, info)
 
         ptc = status.get("print_task_config")
         # Status updates are diffs, and Moonraker merges all components'
@@ -130,15 +179,26 @@ class SpoolLink:
             if new_ids != self._ptc_spool_ids:
                 logging.info("[spoollink] spool_ids changed: %s → %s",
                              self._ptc_spool_ids, new_ids)
-                self._ptc_spool_ids = new_ids
-                self._fire(self._sync_active_spool())
-
-        fd = status.get("filament_detect")
-        if fd is None:
-            return
-        info_list = fd.get("info", [])
-        for ch, info in enumerate(info_list):
-            self._handle_filament_detect_channel(ch, info)
+                old_ids, self._ptc_spool_ids = self._ptc_spool_ids, new_ids
+                for ch, spool_id in enumerate(new_ids):
+                    state = self._channels.setdefault(ch, _Channel())
+                    old_id = old_ids[ch] if ch < len(old_ids) else 0
+                    if spool_id and spool_id != old_id:
+                        state.hold_id = 0
+                        if (state.uid and state.uid not in self._blocked_uids
+                                and spool_id != state.invalidated_id):
+                            state.confirmed_uid = state.uid
+                            state.confirmed_id = spool_id
+                    elif old_id and not spool_id:
+                        if (state.uid == state.confirmed_uid and state.uid
+                                and state.confirmed_id == old_id
+                                and state.uid not in self._blocked_uids):
+                            state.hold_id = old_id
+                            if state.pending is None and state.task is None:
+                                self._verify_zero(ch, state)
+                        else:
+                            state.hold_id = 0
+        self._fire(self._sync_active_spool())
 
     def _handle_filament_detect_channel(self, ch: int, info: Any) -> None:
         if not isinstance(info, dict):
@@ -147,11 +207,106 @@ class SpoolLink:
         if event_time <= self._channel_event_times.get(ch, 0):
             return
         self._channel_event_times[ch] = event_time
+        state = self._channels.setdefault(ch, _Channel())
         uid_hex = self._uid_to_hex(info.get("CARD_UID"))
-        if uid_hex:
+        if uid_hex != state.uid:
+            state.invalidated_id = state.confirmed_id if uid_hex else 0
+            state.confirmed_id = state.hold_id = 0
+        state.uid, state.event_time = uid_hex, event_time
+        state.generation += 1
+        state.pending = None
+        if uid_hex and uid_hex not in self._blocked_uids:
+            if state.confirmed_uid == uid_hex:
+                state.hold_id = state.confirmed_id
             logging.info("[spoollink] ch%d: detected at %.3f (card %s), resolving",
                          ch, event_time, uid_hex)
-            self._fire(self._resolve_spool(ch, card_uid=uid_hex))
+            self._queue_resolution(ch, state, None, uid_hex)
+
+    def _verify_zero(self, ch: int, state: _Channel) -> None:
+        if state.verification is not None and not state.verification.done():
+            return
+        state.verification = self._fire(self._verify_zero_assignment(ch, state))
+
+    async def _verify_zero_assignment(self, ch: int, state: _Channel) -> None:
+        generation = state.generation
+        revision = self._status_revision
+        verify_again = False
+        try:
+            status = await self.klippy_apis.query_objects({
+                "filament_detect": None, "print_task_config": ["filament_spool_id"],
+                "spoollink": ["generation"],
+            })
+            if self._channels.get(ch) is not state or state.generation != generation:
+                return
+            if self._status_revision != revision:
+                # Подписка уже принесла более новое состояние, чем запрос.
+                verify_again = True
+                return
+            self._handle_status_update(status, 0.)
+            # Без нового события или незавершённого чтения это явный сброс.
+            if (state.generation == generation and not state.reading
+                    and state.pending is None and state.task is None):
+                state.hold_id = 0
+        except Exception:
+            if self._channels.get(ch) is state and state.generation == generation:
+                state.hold_id = 0
+            logging.exception("[spoollink] ch%d: cannot verify cleared assignment", ch)
+        finally:
+            state.verification = None
+            await self._sync_active_spool()
+            if verify_again and self._channels.get(ch) is state and state.hold_id:
+                self._verify_zero(ch, state)
+
+    def _queue_resolution(self, ch: int, state: _Channel,
+                          spool_id: Any, uid: str) -> None:
+        state.pending = {
+            "spool_id": spool_id, "uid": uid, "event_time": state.event_time,
+            "generation": state.generation,
+            "klipper_generation": state.klipper_generation,
+        }
+        self._start_worker(ch, state)
+
+    def _start_worker(self, ch: int, state: _Channel) -> None:
+        if state.task is None and state.pending is not None:
+            if state.pending["uid"] in self._unlinking_uids:
+                return
+            state.task = self._fire(self._resolution_worker(ch, state))
+
+    def _is_current(self, ch: int, state: _Channel, request: dict) -> bool:
+        return (self._channels.get(ch) is state
+                and state.generation == request["generation"]
+                and state.uid == request["uid"]
+                and state.event_time == request["event_time"]
+                and request["uid"] not in self._blocked_uids)
+
+    async def _resolution_worker(self, ch: int, state: _Channel) -> None:
+        try:
+            while state.pending is not None:
+                request, state.pending = state.pending, None
+                if request["uid"] in self._unlinking_uids:
+                    state.pending = request
+                    return
+                try:
+                    spool = await self._perform_resolution(ch, state, request)
+                except _StaleResolution:
+                    continue
+                if self._is_current(ch, state, request):
+                    state.hold_id = 0
+                    if spool is not None:
+                        state.confirmed_uid = state.uid
+                        state.confirmed_id = spool["id"]
+                        state.invalidated_id = 0
+                        while len(self._ptc_spool_ids) <= ch:
+                            self._ptc_spool_ids.append(0)
+                        self._ptc_spool_ids[ch] = spool["id"]
+                    await self._sync_active_spool()
+        finally:
+            state.task = None
+            if self._channels.get(ch) is state:
+                if state.pending is None:
+                    state.hold_id = 0
+                    await self._sync_active_spool()
+                self._start_worker(ch, state)
 
     # -- Active spool sync --------------------------------------------------
 
@@ -178,6 +333,15 @@ class SpoolLink:
         channel = self._extruder_to_channel(self._toolhead_extruder)
         spool_id = (self._ptc_spool_ids[channel]
                     if channel < len(self._ptc_spool_ids) else 0) or 0
+        state = self._channels.get(channel)
+        if state is not None:
+            if state.uid in self._blocked_uids or spool_id == state.invalidated_id:
+                spool_id = 0
+            if (not spool_id and state.hold_id
+                    and state.uid == state.confirmed_uid
+                    and state.uid not in self._blocked_uids):
+                spool_id = state.hold_id
+        spool_id = spool_id or None
         if spool_id == self._active_spool_id:
             return
         logging.info("[spoollink] set active spool: channel=%d spool_id=%s → %s",
@@ -196,11 +360,14 @@ class SpoolLink:
 
     async def _spoollink_set(self, channel: int, message: str,
                              info: Optional[dict] = None,
-                             status: str = "ok") -> Optional[dict]:
+                             status: str = "ok",
+                             expected: Optional[dict] = None) -> Optional[dict]:
         params: Dict[str, Any] = {
             "channel": channel, "message": message, "status": status}
         if info is not None:
             params["info"] = info
+        if expected is not None:
+            params.update(expected)
         try:
             return await self.klippy_apis._send_klippy_request(SET_ENDPOINT, params)
         except self.server.error as e:
@@ -224,9 +391,11 @@ class SpoolLink:
             logging.error("[spoollink] background task failed: %s",
                           task.exception(), exc_info=task.exception())
 
-    async def _retry(self, fn, *args, retries=3, **kwargs):
+    async def _retry(self, fn, *args, retries=3, valid=None, **kwargs):
         delay = 1.0
         for attempt in range(retries + 1):
+            if valid is not None and not valid():
+                raise _StaleResolution()
             try:
                 return await fn(*args, **kwargs)
             except Exception as e:
@@ -251,6 +420,9 @@ class SpoolLink:
         try:
             with open(path) as f:
                 spool = json.load(f)
+            if (not isinstance(spool, dict) or type(spool.get("id")) is not int
+                    or spool["id"] <= 0 or not isinstance(spool.get("filament"), dict)):
+                raise ValueError("invalid cached spool")
             logging.info("[spoollink] cache hit for card %s (spool %s)",
                          card_uid, spool.get("id"))
             return spool
@@ -369,33 +541,87 @@ class SpoolLink:
         """Unbind a card from every spool holding it, so clearing a channel
         is not undone by the next scan of the same card."""
         card_uid = str(card_uid or "").upper()
-        if channel is None or not card_uid.strip("0"):
+        if channel is None:
             return
+        states = [(ch, state) for ch, state in self._channels.items()
+                  if ch == channel or card_uid and state.uid == card_uid]
+        if card_uid:
+            self._blocked_uids.add(card_uid)
+            self._unlinking_uids.add(card_uid)
+        for ch, state in states:
+            state.generation += 1
+            state.pending = None
+            state.confirmed_id = state.hold_id = 0
+            state.invalidated_id = (self._ptc_spool_ids[ch]
+                                    if ch < len(self._ptc_spool_ids) else 0)
+        # Отмена и удаление кэша происходят до первого ожидания сети.
         self._delete_cache(card_uid)
+        await self._sync_active_spool()
         try:
+            # Даём уже отправленной записи UID завершиться перед отвязкой.
+            tasks = [state.task for _, state in states if state.task is not None]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if not card_uid.strip("0"):
+                return
             spools = await self._retry(self._spoolman_find_by_card, card_uid)
+            unlinked = True
+            for spool in spools:
+                try:
+                    await self._retry(
+                        self._spoolman_remove_card_uid, spool, card_uid)
+                    logging.info("[spoollink] ch%d: unbound card %s from spool %s",
+                                 channel, card_uid, spool["id"])
+                except Exception as e:
+                    unlinked = False
+                    logging.error("[spoollink] ch%d: unbind from spool %s failed: %s",
+                                  channel, spool["id"], e)
+            if unlinked:
+                self._blocked_uids.discard(card_uid)
         except Exception as e:
             logging.error("[spoollink] ch%d: unlink card %s failed: %s",
                           channel, card_uid, e)
-            return
-        for spool in spools:
-            try:
-                await self._retry(
-                    self._spoolman_remove_card_uid, spool, card_uid)
-                logging.info("[spoollink] ch%d: unbound card %s from spool %s",
-                             channel, card_uid, spool["id"])
-            except Exception as e:
-                logging.error(
-                    "[spoollink] ch%d: unbind card %s from spool %s failed: %s",
-                    channel, card_uid, spool["id"], e)
+        finally:
+            self._unlinking_uids.discard(card_uid)
+            for ch, state in self._channels.items():
+                self._start_worker(ch, state)
 
     async def _resolve_spool(self, channel: int, spool_id: Any = None,
-                             card_uid: Any = None) -> None:
-        spool_id = spool_id or None
-        card_uid = card_uid or None
+                             card_uid: Any = None,
+                             expected_generation: Optional[int] = None) -> None:
         if channel is None:
             logging.error("[spoollink] resolve_spool: missing channel")
             return
+        state = self._channels.setdefault(channel, _Channel())
+        card_uid = str(card_uid or "").upper()
+        if (state.uid != card_uid or not state.event_time
+                or expected_generation is not None
+                and expected_generation != state.klipper_generation):
+            # Макрос читает Klipper напрямую и может опередить подписку.
+            status = await self.klippy_apis.query_objects({
+                "filament_detect": None, "print_task_config": ["filament_spool_id"],
+                "spoollink": ["generation"],
+            })
+            if self._channels.get(channel) is not state:
+                return
+            self._handle_status_update(status, 0.)
+        if (state.uid != card_uid or expected_generation is not None
+                and expected_generation != state.klipper_generation):
+            return
+        state.generation += 1
+        state.hold_id = 0
+        if card_uid not in self._unlinking_uids:
+            self._blocked_uids.discard(card_uid)
+        self._queue_resolution(channel, state, spool_id or None, card_uid)
+
+    async def _perform_resolution(self, channel: int, state: _Channel,
+                                   request: dict) -> Optional[dict]:
+        spool_id, card_uid = request["spool_id"], request["uid"] or None
+        valid = lambda: self._is_current(channel, state, request)
+        def check():
+            if not valid():
+                raise _StaleResolution()
+        check()
         logging.debug("[spoollink] ch%d: resolve spool_id=%s card_uid=%s",
                       channel, spool_id, card_uid)
         spool_by_id = None
@@ -404,7 +630,8 @@ class SpoolLink:
 
         if spool_id is not None:
             try:
-                spool_by_id = await self._retry(self._spoolman_get_by_id, spool_id)
+                spool_by_id = await self._retry(
+                    self._spoolman_get_by_id, spool_id, valid=valid)
             except Exception as e:
                 logging.error("[spoollink] ch%d: fetch spool %s failed: %s",
                               channel, spool_id, e)
@@ -413,13 +640,15 @@ class SpoolLink:
         if card_uid is not None:
             try:
                 spools_by_card = await self._retry(
-                    self._spoolman_find_by_card, card_uid)
+                    self._spoolman_find_by_card, card_uid, valid=valid)
             except Exception as e:
                 logging.error("[spoollink] ch%d: fetch by card failed: %s",
                               channel, e)
                 spoolman_ok = False
 
+        check()
         if len(spools_by_card) > 1:
+            self._delete_cache(card_uid)
             ids = ", ".join(f"#{s['id']}" for s in spools_by_card)
             logging.warning("[spoollink] ch%d: card %s assigned to multiple spools: %s",
                             channel, card_uid, ids)
@@ -453,7 +682,7 @@ class SpoolLink:
             if card_uid.upper() not in _parse_card_uids(spool_by_id):
                 try:
                     spool = await self._retry(
-                        self._spoolman_add_card_uid, spool_by_id, card_uid)
+                        self._spoolman_add_card_uid, spool_by_id, card_uid, valid=valid)
                     logging.info("[spoollink] ch%d: bound spool %s to card %s",
                                  channel, spool_by_id["id"], card_uid)
                 except Exception as e:
@@ -461,11 +690,12 @@ class SpoolLink:
                                   channel, spool_by_id["id"], e)
 
             for stale in spools_by_card:
+                check()
                 if stale["id"] == spool_by_id["id"]:
                     continue
                 try:
                     await self._retry(
-                        self._spoolman_remove_card_uid, stale, card_uid)
+                        self._spoolman_remove_card_uid, stale, card_uid, valid=valid)
                     logging.info("[spoollink] ch%d: unbound card %s from spool %s",
                                  channel, card_uid, stale["id"])
                 except Exception as e:
@@ -473,13 +703,21 @@ class SpoolLink:
                         "[spoollink] ch%d: unbind card %s from spool %s failed: %s",
                         channel, card_uid, stale["id"], e)
 
-        if card_uid is not None and spoolman_ok:
+        check()
+        applied = await self._apply_spool(
+            channel, spool, card_uid or "", cached=cached, expected={
+                "expected_uid": request["uid"],
+                "expected_card_event_time": request["event_time"],
+                "expected_generation": request["klipper_generation"],
+            })
+        check()
+        if applied and card_uid is not None and spoolman_ok:
             self._save_cache(card_uid, spool)
-
-        await self._apply_spool(channel, spool, card_uid or "", cached=cached)
+        return spool if applied else None
 
     async def _apply_spool(self, channel: int, spool: dict, uid_hex: str,
-                           cached: bool = False) -> None:
+                           cached: bool = False,
+                           expected: Optional[dict] = None) -> bool:
         spool_id = spool.get("id", 0)
         filament = spool.get("filament", {})
         material = filament.get("material", "PLA")
@@ -536,9 +774,11 @@ class SpoolLink:
             channel, spool_id, vendor, material,
             f" {variant}" if variant else "",
             color_hex, uid_hex or "none")
-        reply = await self._spoollink_set(channel, message, info=info)
-        if reply is not None:
+        reply = await self._spoollink_set(channel, message, info=info, expected=expected)
+        if reply is not None and reply.get("applied", True):
             logging.info("[spoollink] ch%d: spool %s applied", channel, spool_id)
+            return True
+        return False
 
 
 def load_component(config: ConfigHelper) -> SpoolLink:

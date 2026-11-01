@@ -1,0 +1,20 @@
+name: Проверки SpoolLink
+
+on:
+  pull_request:
+    paths:
+      - 'overlays/firmware-extended/38-feature-spoollink/**'
+      - 'overlays/firmware-extended/13-patch-rfid/**'
+      - '.github/workflows/spoollink-tests.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  spoollink:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Проверить чтение, назначение, расход и ручную отвязку
+        run: python3 -B -m unittest discover -s overlays/firmware-extended/38-feature-spoollink/test -v
