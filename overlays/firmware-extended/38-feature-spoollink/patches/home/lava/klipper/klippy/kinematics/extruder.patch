@@ -1,0 +1,12 @@
+--- a/extruder.py
++++ b/extruder.py
+@@ -815,6 +815,9 @@
+                           1., can_pressure_advance, 0.,
+                           start_v, cruise_v, accel, move.line)
+         self.last_position = move.end_pos[3]
++        spoollink = self.printer.lookup_object('spoollink', None)
++        if spoollink is not None:
++            spoollink.record_move(self.name, move.axes_d[3])
+     def find_past_position(self, print_time):
+         if self.extruder_stepper is None:
+             return 0.

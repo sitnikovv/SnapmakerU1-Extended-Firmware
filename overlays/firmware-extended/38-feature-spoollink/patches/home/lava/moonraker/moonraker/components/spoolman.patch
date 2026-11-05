@@ -1,0 +1,369 @@
+--- a/spoolman.py
++++ b/spoolman.py
+@@ -6,6 +6,7 @@
+ 
+ from __future__ import annotations
+ import asyncio
++import json
+ import logging
+ import re
+ import contextlib
+@@ -43,6 +44,9 @@
+         self.sync_rate_seconds = config.getint("sync_rate", default=5, minval=1)
+         self.report_timer = self.eventloop.register_timer(self.report_extrusion)
+         self.pending_reports: Dict[int, float] = {}
++        self._inflight_reports: Dict[int, float] = {}
++        self._usage_operations: dict = {}
++        self._report_task: Optional[asyncio.Task] = None
+         self.spoolman_ws: Optional[WebSocketClientConnection] = None
+         self.connection_task: Optional[asyncio.Task] = None
+         self.spool_check_task: Optional[asyncio.Task] = None
+@@ -52,6 +56,11 @@
+         self.spool_id: Optional[int] = None
+         self._error_logged: bool = False
+         self._highest_epos: float = 0
++        self._extrusion_session: Optional[str] = None
++        self._extrusion_heads: dict = {}
++        self._feed_ready = False
++        # False when Klipper runs without the [spoollink] router.
++        self._use_router = True
+         self._current_extruder: str = "extruder"
+         self.spool_history = HistoryFieldData(
+             "spool_ids", "spoolman", "Spool IDs used", "collect",
+@@ -116,6 +125,9 @@
+         return [self.spool_id]
+ 
+     async def component_init(self) -> None:
++        spoollink = self.server.lookup_component('spoollink', None)
++        if spoollink is not None:
++            await spoollink.restore_state()
+         self.spool_id = await self.database.get_item(
+             DB_NAMESPACE, ACTIVE_SPOOL_KEY, None
+         )
+@@ -201,10 +213,17 @@
+         event: Dict[str, Any] = jsonw.loads(message)
+         if event.get("resource") != "spool":
+             return
++        payload: Dict[str, Any] = event.get("payload") or {}
++        bridge = self.server.lookup_component('spoollink', None)
++        if bridge is not None and self._use_router:
++            # The bridge keeps the unsent usage of a deleted spool for its channel.
++            bridge.handle_spool_event(event.get("type"), payload)
+         if self.spool_id is not None and event.get("type") == "deleted":
+-            payload: Dict[str, Any] = event.get("payload", {})
+             if payload.get("id") == self.spool_id:
+                 self.pending_reports.pop(self.spool_id, None)
++                if self.spool_id not in self._inflight_reports:
++                    self._usage_operations.pop(self.spool_id, None)
++                self._save_usage()
+                 self.set_active_spool(None)
+ 
+     def _cancel_spool_check_task(self) -> None:
+@@ -221,6 +240,9 @@
+             if response.status_code == 404:
+                 logging.info(f"Spool ID {self.spool_id} not found, setting to None")
+                 self.pending_reports.pop(self.spool_id, None)
++                if self.spool_id not in self._inflight_reports:
++                    self._usage_operations.pop(self.spool_id, None)
++                self._save_usage()
+                 self.set_active_spool(None)
+             elif response.has_error():
+                 err_msg = self._get_response_error(response)
+@@ -236,19 +258,40 @@
+         self._last_ping_received = self.eventloop.get_loop_time()
+ 
+     async def _handle_klippy_ready(self) -> None:
+-        result: Dict[str, Dict[str, Any]]
+-        result = await self.klippy_apis.subscribe_objects(
+-            {"toolhead": ["position", "extruder"]}, self._handle_status_update, {}
+-        )
+-        toolhead = result.get("toolhead", {})
+-        self._current_extruder = toolhead.get("extruder", "extruder")
+-        initial_e_pos = toolhead.get("position", [None]*4)[3]
+-        logging.debug(f"Initial epos: {initial_e_pos}")
+-        if initial_e_pos is not None:
+-            self._highest_epos = initial_e_pos
+-        else:
+-            logging.error("Spoolman integration unable to subscribe to epos")
+-            raise self.server.error("Unable to subscribe to e position")
++        self._feed_ready = False
++        bridge = self.server.lookup_component('spoollink', None)
++        objects = {"toolhead": ["position", "extruder"]}
++        # Klipper may run without the router after a partial update.
++        known = await self.klippy_apis.get_object_list([])
++        self._use_router = bridge is not None and 'spoollink' in known
++        if self._use_router:
++            objects['spoollink'] = ['session_id', 'feed', 'feed_initialized', 'channels']
++        result = await self.klippy_apis.subscribe_objects(objects, self._handle_status_update, {})
++        toolhead = result.get('toolhead', {})
++        self._current_extruder = toolhead.get('extruder', 'extruder')
++        if self._use_router:
++            snapshot = result['spoollink']
++            session = snapshot['session_id']
++            if session != self._extrusion_session:
++                retractions = {name: self._extrusion_heads.get(name, {}).get('retracted', 0.)
++                               for name in snapshot['feed']}
++                if not snapshot['feed_initialized']:
++                    snapshot = await self.klippy_apis._send_klippy_request('spoollink/feed', {
++                        'session_id': session, 'retractions': retractions,
++                    })
++                self._extrusion_heads = {name: {'total': 0., 'retracted': retractions[name], 'usage': {}}
++                                         for name in snapshot['feed']}
++                self._extrusion_session = session
++            elif not snapshot['feed_initialized']:
++                raise self.server.error('Klipper feed tracking lost its initialization')
++            self._feed_ready = True
++            self._handle_status_update(dict(result, spoollink=snapshot), 0.)
++            await self._save_usage()
++            return
++        initial_e_pos = toolhead.get('position', [None]*4)[3]
++        if initial_e_pos is None:
++            raise self.server.error('Unable to subscribe to e position')
++        self._highest_epos = initial_e_pos
+ 
+     def _get_response_error(self, response: HttpResponse) -> str:
+         err_msg = f"HTTP error: {response.status_code} {response.error}"
+@@ -258,11 +301,44 @@
+         return err_msg
+ 
+     def _handle_status_update(self, status: Dict[str, Any], _: float) -> None:
+-        toolhead: Optional[Dict[str, Any]] = status.get("toolhead")
+-        if toolhead is None:
+-            return
+-        epos: float = toolhead.get("position", [0, 0, 0, self._highest_epos])[3]
++        toolhead = status.get("toolhead", {})
+         extr = toolhead.get("extruder", self._current_extruder)
++        bridge = self.server.lookup_component("spoollink", None)
++        if bridge is not None and self._use_router:
++            snapshot = status.get('spoollink', {})
++            if (not self._feed_ready
++                    or snapshot.get('session_id', self._extrusion_session) != self._extrusion_session
++                    or snapshot.get('feed_initialized') is False):
++                return
++            self._current_extruder = extr
++            heads, changes = {}, []
++            for name, current in snapshot.get('feed', {}).items():
++                row = self._extrusion_heads.setdefault(name, {'total': 0., 'retracted': 0., 'usage': {}})
++                if current['total'] < row['total'] - 0.000001:
++                    raise self.server.error('Klipper feed total went backwards')
++                previous = row['usage']
++                usage = {}
++                for target in current['usage']:
++                    parts = [target['uid'], target['spool_id'], target['requested_spool_id']]
++                    if target.get('waiting'):
++                        parts.append(True)
++                    key = json.dumps(parts, separators=(',', ':'))
++                    length = target['length'] - previous.get(key, 0.)
++                    if length < -0.000001:
++                        raise self.server.error('Klipper usage total went backwards')
++                    usage[key] = target['length']
++                    if length > 0.:
++                        changes.append((name, target, length))
++                updated = {'total': current['total'], 'retracted': current['retracted'], 'usage': usage}
++                changed = row != updated
++                if changed:
++                    heads[name] = updated
++            if heads:
++                bridge.record_feed(heads, changes)
++            return
++        if not toolhead:
++            return
++        epos = toolhead.get("position", [0, 0, 0, self._highest_epos])[3]
+         if extr != self._current_extruder:
+             self._highest_epos = epos
+             self._current_extruder = extr
+@@ -276,6 +352,42 @@
+             self.pending_reports[spool_id] += used_length
+         else:
+             self.pending_reports[spool_id] = used_length
++        self._save_usage(deferred=True)
++
++    def take_unsent(self, spool_id: int) -> float:
++        """Remove and return the usage of a spool that was not delivered.
++
++        A request that is on the way may already be applied by Spoolman. Its
++        amount stays in the send loop, which learns the outcome from the reply.
++        A 404 returns that amount through `_spool_missing`.
++        """
++        lost = self.pending_reports.pop(spool_id, 0.)
++        sending = self._usage_operations.get(spool_id)
++        inflight = self._inflight_reports.pop(spool_id, 0.)
++        if sending is not None and inflight:
++            kept = min(sending['length'], inflight)
++            self._inflight_reports[spool_id] = kept
++            lost += inflight - kept
++        else:
++            lost += inflight
++            self._usage_operations.pop(spool_id, None)
++        self._save_usage()
++        return lost
++
++    def _save_usage(self, deferred: bool = False) -> asyncio.Future:
++        spoollink = self.server.lookup_component('spoollink', None)
++        if spoollink is not None:
++            if deferred:
++                # Klipper keeps running totals, so a lost tail of new feed is
++                # counted again. Moves of waiting usage are saved at once.
++                spoollink.request_save()
++                saved = asyncio.get_running_loop().create_future()
++                saved.set_result(None)
++                return saved
++            return spoollink.save_state()
++        saved = asyncio.get_running_loop().create_future()
++        saved.set_result(None)
++        return saved
+ 
+     def set_active_spool(self, spool_id: Union[int, None]) -> None:
+         assert spool_id is None or isinstance(spool_id, int)
+@@ -290,45 +402,117 @@
+         )
+         logging.info(f"Setting active spool to: {spool_id}")
+ 
++    async def _used_length(self, spool_id: int) -> Optional[float]:
++        """The used length stored in Spoolman, or None when the spool is gone."""
++        response = await self.http_client.get(
++            f"{self.spoolman_url}/v1/spool/{spool_id}", enable_cache=False)
++        if response.status_code == 404:
++            return None
++        if response.has_error():
++            raise self.server.error(self._get_response_error(response))
++        return float(response.json().get('used_length') or 0.)
++
++    def _spool_missing(self, spool_id: int) -> None:
++        lost = (self.pending_reports.pop(spool_id, 0.)
++                + self._inflight_reports.pop(spool_id, 0.))
++        self._usage_operations.pop(spool_id, None)
++        bridge = self.server.lookup_component('spoollink', None)
++        if bridge is not None and self._use_router:
++            bridge.spool_missing(spool_id, lost)
++        if spool_id == self.spool_id:
++            self.set_active_spool(None)
++
++    async def _send_reports(self, protected: bool) -> None:
++        for spool_id in list(self._inflight_reports):
++            while spool_id in self._inflight_reports:
++                if not self.ws_connected or self.is_closing:
++                    break
++                available = self._inflight_reports[spool_id]
++                operation = self._usage_operations.get(spool_id)
++                applied = False
++                if protected:
++                    # The server cannot recognize a repeated request. So the used
++                    # length is compared with the value seen before the first try.
++                    used = await self._used_length(spool_id)
++                    if used is None:
++                        self._spool_missing(spool_id)
++                        await self._save_usage()
++                        break
++                    if operation is not None and 'before' in operation:
++                        applied = (used - operation['before']
++                                   >= operation['length'] - 0.000001)
++                    else:
++                        operation = dict(operation or {'length': available},
++                                         before=used)
++                        self._usage_operations[spool_id] = operation
++                length = operation['length'] if operation else available
++                if not applied:
++                    body = {'use_length': length}
++                    # Save the start length and the exact amount before the request can reach the server.
++                    await self._save_usage()
++                    response = await self.http_client.request(
++                        method='PUT', url=f"{self.spoolman_url}/v1/spool/{spool_id}/use", body=body)
++                    if response.has_error():
++                        if response.status_code == 404:
++                            self._spool_missing(spool_id)
++                            await self._save_usage()
++                        elif not self._error_logged:
++                            self._error_logged = True
++                            logging.info('Failed to update usage for spool %s: %s',
++                                         spool_id, self._get_response_error(response))
++                        break
++                self._usage_operations.pop(spool_id, None)
++                # The queue may have changed while the request was on the way.
++                remaining = self._inflight_reports.get(spool_id, 0.) - length
++                if remaining > 0.0000001:
++                    self._inflight_reports[spool_id] = remaining
++                else:
++                    self._inflight_reports.pop(spool_id, None)
++                self._save_usage(deferred=True)
++                self._error_logged = False
++
+     async def report_extrusion(self, eventtime: float) -> float:
+-        if not self.ws_connected:
++        if (not self.ws_connected or self.is_closing
++                or self._report_task is not None or not self.pending_reports):
+             return eventtime + self.sync_rate_seconds
+-        pending_reports = self.pending_reports
++        self._report_task = asyncio.current_task()
++        self._inflight_reports = self.pending_reports
+         self.pending_reports = {}
+-        for spool_id, used_length in pending_reports.items():
+-            if not self.ws_connected:
+-                self._add_extrusion(spool_id, used_length)
+-                continue
+-            logging.debug(
+-                f"Sending spool usage: ID: {spool_id}, Length: {used_length:.3f}mm"
+-            )
+-            response = await self.http_client.request(
+-                method="PUT",
+-                url=f"{self.spoolman_url}/v1/spool/{spool_id}/use",
+-                body={"use_length": used_length}
+-            )
+-            if response.has_error():
+-                if response.status_code == 404:
+-                    # Since the spool is deleted we can remove any pending reports
+-                    # added while waiting for the request
+-                    self.pending_reports.pop(spool_id, None)
+-                    if spool_id == self.spool_id:
+-                        logging.info(f"Spool ID {spool_id} not found, setting to None")
+-                        self.set_active_spool(None)
+-                else:
+-                    if not self._error_logged:
+-                        error_msg = self._get_response_error(response)
+-                        self._error_logged = True
+-                        logging.info(
+-                            f"Failed to update extrusion for spool id {spool_id}, "
+-                            f"received {error_msg}"
+-                        )
+-                    # Add missed reports back to pending reports for the next cycle
+-                    self._add_extrusion(spool_id, used_length)
+-                    continue
+-            self._error_logged = False
++        try:
++            protected = self.server.lookup_component('spoollink', None) is not None
++            await self._send_reports(protected)
++        except asyncio.CancelledError:
++            raise
++        except Exception as error:
++            # An exception that leaves the timer callback stops the timer for good.
++            # The usage stays queued and the next round tries again.
++            if not self._error_logged:
++                self._error_logged = True
++                logging.info('Failed to report filament usage: %s', error)
++        finally:
++            remaining = self._inflight_reports
++            self._inflight_reports = {}
++            for spool_id, length in remaining.items():
++                self.pending_reports[spool_id] = self.pending_reports.get(spool_id, 0.) + length
++            self._report_task = None
++            self._save_usage(deferred=True)
+         return self.eventloop.get_loop_time() + self.sync_rate_seconds
+ 
++    async def on_exit(self) -> None:
++        self.is_closing = True
++        self.report_timer.stop()
++        task = self._report_task
++        if task is not None:
++            try:
++                await asyncio.wait_for(asyncio.shield(task), 2.)
++            except asyncio.TimeoutError:
++                task.cancel()
++                with contextlib.suppress(asyncio.CancelledError):
++                    await task
++        spoollink = self.server.lookup_component('spoollink', None)
++        if spoollink is not None:
++            await spoollink.flush_state()
++
+     async def _handle_spool_id_request(self, web_request: WebRequest):
+         if web_request.get_request_type() == RequestType.POST:
+             spool_id = web_request.get_int("spool_id", None)
