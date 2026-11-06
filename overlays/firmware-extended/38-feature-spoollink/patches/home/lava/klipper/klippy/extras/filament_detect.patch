@@ -1,0 +1,71 @@
+--- a/filament_detect.py
++++ b/filament_detect.py
+@@ -60,7 +60,7 @@
+         if not self._fm175xx_reader.enabled:
+             self._fm175xx_reader = None
+         if (self._fm175xx_reader is not None):
+-            self._fm175xx_reader.register_cb_2_card_info_deal(self._fm175xx_card_info_deal_callback)
++            self._fm175xx_reader.register_cb_2_card_info_deal(self._queue_card_result)
+ 
+         if self._config['startup_stay'] == False:
+             for i in range(self._channel_nums):
+@@ -92,7 +92,6 @@
+                 self.request_update_filament_info(extruder)
+             else:
+                 if e_obj['filament_detected'] == True:
+-                    self.request_clear_filament_info(extruder)
+                     self.request_update_filament_info(extruder)
+                 else:
+                     self.request_clear_filament_info(extruder)
+@@ -103,17 +102,28 @@
+                 self.request_clear_filament_info(extruder)
+ 
+ 
+-    def _filament_info_update(self, channel, info, is_clear=False):
++    def _filament_info_update(self, channel, info, is_clear=False,
++                              reader_result=False, notify=True):
+         info['CARD_EVENT_TIME'] = self.reactor.monotonic()
++        spoollink = self.printer.lookup_object('spoollink', None)
++        if spoollink is not None:
++            spoollink.reader_update(channel, info, is_clear and not reader_result)
+         self._filament_info[channel] = info
+ 
+         # notify
+-        if (0 != len(self._notify_data_update_cb)):
++        if notify and self._notify_data_update_cb:
+             for i in range(len(self._notify_data_update_cb)):
+                 self.reactor.register_async_callback(
+                     (lambda et, c=self._notify_data_update_cb[i],
+                         info=self._filament_info[channel]: c(channel, info, is_clear)))
+ 
++    def _queue_card_result(self, channel, operation, result, card_type, card_data):
++        # Handle reader results on the Klipper thread.
++        payload = list(card_data) if card_data is not None else None
++        self.reactor.register_async_callback(lambda eventtime:
++            self._fm175xx_card_info_deal_callback(
++                channel, operation, result, card_type, payload))
++
+     def _fm175xx_card_info_deal_callback(self, channel, operation, result, card_type, card_data):
+         filament_info = None
+         is_clear = False
+@@ -252,14 +262,15 @@
+                 raise web_request.error("unsupported fields: %s" % (', '.join(sorted(params.keys()))))
+ 
+             filament_info['OFFICIAL'] = has_params
+-            filament_info['CARD_EVENT_TIME'] = self.reactor.monotonic()
+             self._state[channel] = FILAMENT_DT_STATE_IDLE
+ 
+-            ptc = self.printer.lookup_object('print_task_config', None)
+-            if has_params or ptc is not None and ptc.print_task_config['filament_official'][channel]:
+-                self._filament_info_update(channel, filament_info, True)
++            if has_params:
++                self._filament_info_update(channel, filament_info, True,
++                                           reader_result=True)
+             else:
+-                self._filament_info[channel] = filament_info
++                # An empty read must not clear the channel's filament settings.
++                self._filament_info_update(channel, filament_info,
++                                           reader_result=True, notify=False)
+             web_request.send({'state': 'success'})
+         except Exception as e:
+             logging.error("[filament_detect] set: %s", str(e))
