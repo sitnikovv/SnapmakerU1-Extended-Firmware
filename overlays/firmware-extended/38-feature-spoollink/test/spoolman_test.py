@@ -118,15 +118,60 @@ class KlippyAPI:
     async def run_gcode(self, *args):
         pass
 
+    async def query_objects(self, objects):
+        return {}
+
+    async def subscribe_objects(self, objects, callback=None):
+        return {}
+
+    async def get_object_list(self):
+        return []
+
+
+# An in-memory stand-in for a Moonraker database namespace. Its methods
+# return futures that are already done, like the real wrapper's results.
+class Namespace:
+    def __init__(self):
+        self.data = {}
+
+    def _done(self, value):
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(value)
+        return future
+
+    def insert(self, key, value):
+        self.data[key] = json.loads(json.dumps(value))
+        return self._done(None)
+
+    def get(self, key, default=None):
+        value = self.data.get(key, default)
+        return self._done(json.loads(json.dumps(value)))
+
+    def delete(self, key):
+        return self._done(self.data.pop(key, None))
+
+
+class Database:
+    def __init__(self):
+        self.namespaces = {}
+
+    def register_local_namespace(self, name, forbidden=False):
+        return self.namespaces.setdefault(name, Namespace())
+
 
 class Server:
     error = Exception
 
     def __init__(self):
-        self.components = {"http_client": HttpClient(), "klippy_apis": KlippyAPI()}
+        self.components = {"http_client": HttpClient(), "klippy_apis": KlippyAPI(),
+                           "database": Database()}
 
-    def lookup_component(self, name):
-        return self.components[name]
+    def lookup_component(self, name, default=KeyError):
+        if name in self.components:
+            return self.components[name]
+        if default is KeyError:
+            raise self.error(f"component {name} not found")
+        return default
 
     def register_remote_method(self, *args):
         pass
@@ -162,6 +207,8 @@ class ConfigHelper:
 def load_spoollink(**config):
     spec = importlib.util.spec_from_file_location("spoollink", COMPONENT)
     module = importlib.util.module_from_spec(spec)
+    # Dataclasses look up their module in sys.modules while it loads.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module.SpoolLink(ConfigHelper({"server": URL, **config}))
 

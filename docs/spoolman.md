@@ -18,6 +18,9 @@ Automatic filament metadata sync and spool tracking via
   known card loads its filament without any manual step.
 - Tracks the active spool in Moonraker so Spoolman can update remaining
   filament weight as you print.
+- Keeps the usage on the right spool through tag rescans, unknown tags,
+  deleted spools, Spoolman outages and restarts (see
+  [Usage Tracking](#usage-tracking)).
 
 ## Screenshots
 
@@ -63,6 +66,46 @@ a spool's second tag, or to link a blank tag to a spool that already exists.
 Hovering the card's Spoolman badge lists the spool's stored UIDs.
 
 ![Assign tab, with the suggested spool listed first](screenshots/filament-manager-spoolman-suggested-spools.png)
+
+## Usage Tracking
+
+Moonraker reports the filament each channel uses to the spool SpoolLink
+assigned to it.
+
+- **Rescans.** Reading the tag of the assigned spool again keeps the spool
+  assigned, also while Spoolman is unreachable. A reader result without a tag
+  keeps an assigned spool and its filament settings; removing the filament
+  clears the channel. If the first read after Klipper starts finds no tag on a
+  channel that was assigned through its tag, the assignment is removed.
+- **Unknown tags.** The usage of a tag that no spool carries is saved under
+  the tag's UID. As soon as a spool gets the tag (**Create** in Filament
+  Manager, the UID added in Spoolman, or another read), that spool receives the
+  saved usage and the channel is assigned to it.
+- **Missing spools.** If the assigned spool is deleted from Spoolman, or
+  `SET_SPOOL_ID` names a spool that does not exist, the console shows a
+  message and the channel is unassigned. Its usage, including any not yet
+  sent, waits under the tag's UID, or for the next spool selected on a channel
+  without a tag. A new spool that gets the number of a deleted spool is not
+  assigned by that number.
+- **Clear.** `SET_SPOOL_ID … SPOOL_ID=0` unassigns the channel and removes its
+  tag from the spool. If Spoolman cannot remove the tag, SpoolLink keeps
+  trying, and the tag does not assign a spool again until the removal works
+  or a spool is selected.
+- **Read spool tags.** **Read spool tags** and **↻ Refresh** in Filament
+  Manager read the tags again, and each channel keeps its spool during the
+  read. `FILAMENT_DT_CLEAR`, which **Reset channel** sends, unassigns a spool
+  that was assigned through the channel's tag. On a channel without a tag it
+  keeps a spool selected by hand and the usage that waits for a selection;
+  removing the filament or Clear unassigns that spool.
+- **Restarts and outages.** Waiting usage, unsent reports and pending tag
+  removals are saved in Moonraker's database and survive restarts of Klipper,
+  Moonraker and the printer. A report whose reply was lost is not recorded
+  twice, and filament fed back after a retraction is counted once.
+- **Another Spoolman server.** Saved usage belongs to the server it was
+  measured for and is never sent to another one.
+
+`SET_PRINT_FILAMENT_CONFIG CONFIG_EXTRUDER=<n> FILAMENT_SPOOL_ID=<id>` with a
+spool number assigns that spool the same way as `SET_SPOOL_ID`.
 
 ## Card UID Storage
 
@@ -186,6 +229,9 @@ available whenever Spoolman is enabled, with or without AFC-Lite.
 - UID ownership checks use the same 1000-spool candidate limit as SpoolLink.
 - Variant defaults to `Basic` for Snapmaker-branded filaments when not
   set in Spoolman; empty for all other vendors.
+- The check against recording a report twice after a lost reply assumes that
+  nothing else changes the spool's used length, or its filament's density or
+  diameter, until the report is confirmed.
 
 For the wire format, custom fields, and component flow see the
 [design notes](design/spoolman.md). For AFC lane status that surfaces
