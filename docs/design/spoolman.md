@@ -224,6 +224,52 @@ it does not maintain its own WebSocket connection.
    `AFC_lane.get_status()` surfaces `spool_id` to Fluidd/Mainsail.
 
 
+# Usage Accounting
+
+Moonraker's `spoolman` component measures the feed of each head and reports it
+to Spoolman. SpoolLink decides which spool each part of that feed belongs to.
+
+- **Feed.** The patched `extruder.py` passes every extruder move to the
+  Klipper `[spoollink]` router. The router counts only filament fed beyond the
+  highest position the head has reached, so filament fed back after a
+  retraction is not new, and keeps these totals per head and per target
+  (below). Moonraker reads the totals from the router's status, charges their
+  growth and saves what it has charged. After a Klipper restart, Moonraker
+  gives the router the retraction each head had (`spoollink/feed`), so the
+  filament fed back then is not counted as new either.
+- **Channel state.** Every reader result, selection and Clear gives the
+  channel a new revision in Klipper. `spoollink_resolve_spool` carries the
+  revision, and replies to an older revision are dropped, so a late lookup
+  cannot restore a previous spool or replace a newer selection. The patched
+  `filament_detect.py` hands reader results to the router on the Klipper
+  thread and keeps the settings of an assigned spool on a reader result
+  without a tag. A `FILAMENT_DT_CLEAR` command on a channel without a tag is
+  skipped while the channel holds a spool selected by hand or usage that
+  waits for a selection; clears from the filament sensors always run.
+- **Targets.** Feed of a channel with a confirmed spool goes to that spool's
+  report queue in the `spoolman` component. Feed without a confirmed spool is
+  kept by SpoolLink under a target: the tag UID, a selected spool number that
+  Spoolman has not confirmed yet, or the channel itself when it waits for the
+  next selection. A waiting target is looked up again when Spoolman reports a
+  change of a spool with that tag or number, and on a timer that starts at 5 s
+  and grows to 300 s.
+- **Saved state.** Waiting targets, unsent and in-flight reports, tags whose
+  removal failed, and the feed totals of each head are saved in one record of
+  Moonraker's database (namespace `spoollink`, key `accounting`). The queues
+  are kept per Spoolman URL, so usage measured for one server is never sent to
+  another.
+- **Lost replies.** Before the first attempt of a report, Moonraker reads the
+  spool's `used_length` and saves it with the report. Before a retry it reads
+  it again and sends the report only when the length has not grown by the
+  reported amount.
+- **Deleted spools.** A `deleted` spool event moves the unsent usage of the
+  spool to the tag of its channel, or to the channel when it has no tag. A
+  report that was on the way at the deletion goes the same way when Spoolman
+  later answers that the spool is missing.
+- **Tag stores.** Lookups, links and removals use the selected
+  [store](#choosing-the-store); with native tags the spool events carry the
+  tags in `tags`.
+
 # Testing
 
 `overlays/firmware-extended/38-feature-spoollink/test/run-spoolman.sh` runs
@@ -233,3 +279,8 @@ it does not maintain its own WebSocket connection.
 the firmware-config commands against a temporary `extended2.cfg`. It covers both card
 UID stores, migration in both directions, and native tags being refused on an older
 Spoolman. It needs Docker and Python 3, and PyYAML for the firmware-config checks.
+
+`run-behavior.sh <upgrade.bin>` in the same folder runs the behavior tests on a
+built image: the Klipper and Moonraker files of the image with a real Spoolman
+behind a fault-injecting proxy, with Spoolman 0.26.1 and 0.27.0 and both tag
+stores. Its `README.md` lists the accounting rules that the tests check.
