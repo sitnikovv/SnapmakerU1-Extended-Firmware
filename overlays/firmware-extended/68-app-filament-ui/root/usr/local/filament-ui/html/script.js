@@ -291,7 +291,6 @@ async function refreshAllChannels() {
 
     try {
         const gcodes = [];
-        for (let i = 0; i < 4; i++) gcodes.push(`FILAMENT_DT_CLEAR CHANNEL=${i}`);
         for (let i = 0; i < 4; i++) gcodes.push(`FILAMENT_DT_UPDATE CHANNEL=${i}`);
         await sendGcode(gcodes.join('\n'));
     } catch (err) {
@@ -305,7 +304,7 @@ async function refreshAllChannels() {
 async function refreshSingleChannel(channel) {
     if (!wsReady) { showStatus('Waiting for connection…', 'info'); return; }
     try {
-        await sendGcode(`FILAMENT_DT_CLEAR CHANNEL=${channel}\nFILAMENT_DT_UPDATE CHANNEL=${channel}`);
+        await sendGcode(`FILAMENT_DT_UPDATE CHANNEL=${channel}`);
     } catch (err) {
         showStatus(`Refresh failed: ${err.message}`, 'error');
     }
